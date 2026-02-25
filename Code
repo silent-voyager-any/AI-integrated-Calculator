@@ -1,0 +1,1236 @@
+
+static constexpr const char* WIFI_SSID = "";
+static constexpr const char* WIFI_PASS = "";
+static constexpr const char* SERVER = "";
+static constexpr const char* API_SEND_PATH = "/api/send";
+static constexpr const char* CHAT_NAME = "";
+static constexpr const char* HTTP_USERNAME = "";
+static constexpr const char* HTTP_PASSWORD = "";
+
+#define USE_PROXY
+static constexpr const char* PROXY_USER = "";
+static constexpr const char* PROXY_PASS = "";
+
+#define SECURE
+
+#include "./launcher.h"
+#include <TICL.h>
+#include <CBL2.h>
+#include <TIVar.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <WiFiClient.h>
+#include <HTTPClient.h>
+#include <UrlEncode.h>
+#include <Preferences.h>
+#include <base64.h>
+
+
+
+#ifdef CAMERA
+#include <esp_camera.h>
+#define CAMERA_MODEL_XIAO_ESP32S3
+#include "./camera_pins.h"
+#include "./camera_index.h"
+#endif
+
+constexpr auto TIP = D1;
+constexpr auto RING = D10;
+constexpr auto MAXHDRLEN = 16;
+constexpr auto MAXDATALEN = 4096;
+constexpr auto MAXARGS = 5;
+constexpr auto MAXSTRARGLEN = 256;
+constexpr auto PICSIZE = 756;
+constexpr auto PICVARSIZE = PICSIZE + 2;
+constexpr auto PASSWORD = 42069;
+
+CBL2 cbl;
+Preferences prefs;
+
+struct ProxyEndpoint {
+  const char* host;
+  uint16_t port;
+  const char* ip;
+};
+
+static constexpr ProxyEndpoint PROXIES[] = {
+  // Primary gateway plus direct gateway-IP fallbacks.
+  { "dc.oxylabs.io", 8000, "" },
+  { "dc.oxylabs.io", 8000, "79.127.200.2" },
+  { "dc.oxylabs.io", 8000, "185.24.9.10" },
+};
+constexpr size_t NUM_PROXIES = sizeof(PROXIES) / sizeof(PROXIES[0]);
+size_t proxy_index = 0;
+
+
+bool unlocked = true;
+
+
+int currentArg = 0;
+char strArgs[MAXARGS][MAXSTRARGLEN];
+double realArgs[MAXARGS];
+
+
+int command = -1;
+
+bool status = 0;
+
+bool error = 0;
+
+char message[MAXSTRARGLEN];
+
+constexpr auto LISTLEN = 256;
+constexpr auto LISTENTRYLEN = 20;
+char list[LISTLEN][LISTENTRYLEN];
+
+constexpr auto MAXHTTPRESPONSELEN = 4096;
+char response[MAXHTTPRESPONSELEN];
+
+constexpr uint16_t HTTP_TIMEOUT_MS = 60 * 1000;
+
+uint8_t frame[PICVARSIZE] = { PICSIZE & 0xff, PICSIZE >> 8 };
+
+void connect();
+void disconnect();
+void gpt();
+void send();
+void launcher();
+void snap();
+void solve();
+void image_list();
+void fetch_image();
+void fetch_chats();
+void send_chat();
+void program_list();
+void fetch_program();
+
+struct Command {
+  int id;
+  const char* name;
+  int num_args;
+  void (*command_fp)();
+  bool wifi;
+};
+
+struct Command commands[] = {
+  { 0, "connect", 0, connect, false },
+  { 1, "disconnect", 0, disconnect, false },
+  { 2, "gpt", 1, gpt, true },
+  { 4, "send", 2, send, true },
+  { 5, "launcher", 0, launcher, false },
+  { 7, "snap", 0, snap, false },
+  { 8, "solve", 1, solve, true },
+  { 9, "image_list", 1, image_list, true },
+  { 10, "fetch_image", 1, fetch_image, true },
+  { 11, "fetch_chats", 2, fetch_chats, true },
+  { 12, "send_chat", 2, send_chat, true },
+  { 13, "program_list", 1, program_list, true },
+  { 14, "fetch_program", 1, fetch_program, true },
+};
+
+constexpr int NUMCOMMANDS = sizeof(commands) / sizeof(struct Command);
+constexpr int MAXCOMMAND = 14;
+
+uint8_t header[MAXHDRLEN];
+uint8_t data[MAXDATALEN];
+
+
+
+void fixStrVar(char* str) {
+  int end = strlen(str);
+  for (int i = 0; i < end; ++i) {
+    if (isLowerCase(str[i])) {
+      --end;
+    }
+  }
+  str[end] = '\0';
+}
+
+int onReceived(uint8_t type, enum Endpoint model, int datalen);
+int onRequest(uint8_t type, enum Endpoint model, int* headerlen,
+              int* datalen, data_callback* data_callback);
+struct ParsedUrl;
+int makePostRequest(String url, const char* contentType, const char* body, char* result, int resultLen, size_t* len);
+int makePostRequestProxy(String url, const char* contentType, const char* body, char* result, int resultLen, size_t* len);
+bool parseUrl(const String& url, ParsedUrl* out);
+int openProxyTunnel(WiFiClientSecure& client, const ParsedUrl& target, const ProxyEndpoint& proxy);
+String jsonEscape(const char* input);
+
+void startCommand(int cmd) {
+  command = cmd;
+  status = 0;
+  error = 0;
+  currentArg = 0;
+  for (int i = 0; i < MAXARGS; ++i) {
+    memset(&strArgs[i], 0, MAXSTRARGLEN);
+    realArgs[i] = 0;
+  }
+  strncpy(message, "no command", MAXSTRARGLEN);
+}
+
+void setError(const char* err) {
+  Serial.print("ERROR: ");
+  Serial.println(err);
+  error = 1;
+  status = 1;
+  command = -1;
+  strncpy(message, err, MAXSTRARGLEN);
+}
+
+void setSuccess(const char* success) {
+  Serial.print("SUCCESS: ");
+  Serial.println(success);
+  error = 0;
+  status = 1;
+  command = -1;
+  strncpy(message, success, MAXSTRARGLEN);
+}
+
+int sendProgramVariable(const char* name, uint8_t* program, size_t variableSize);
+
+bool camera_sign = false;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("[CBL]");
+
+  cbl.setLines(TIP, RING);
+  cbl.resetLines();
+  cbl.setupCallbacks(header, data, MAXDATALEN, onReceived, onRequest);
+  
+
+  pinMode(TIP, INPUT);
+  pinMode(RING, INPUT);
+
+  Serial.println("[preferences]");
+  prefs.begin("ccalc", false);
+  auto reboots = prefs.getUInt("boots", 0);
+  Serial.print("reboots: ");
+  Serial.println(reboots);
+  prefs.putUInt("boots", reboots + 1);
+  prefs.end();
+
+#ifdef CAMERA
+  Serial.println("[camera]");
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.frame_size = FRAMESIZE_UXGA;
+  
+  config.pixel_format = PIXFORMAT_JPEG;  
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
+
+  
+  
+  if (config.pixel_format == PIXFORMAT_JPEG) {
+    if (psramFound()) {
+      config.jpeg_quality = 10;
+      config.fb_count = 2;
+      config.grab_mode = CAMERA_GRAB_LATEST;
+    } else {
+      
+      config.frame_size = FRAMESIZE_SVGA;
+      config.fb_location = CAMERA_FB_IN_DRAM;
+    }
+  } else {
+    
+    config.frame_size = FRAMESIZE_240X240;
+#if CONFIG_IDF_TARGET_ESP32S3
+    config.fb_count = 2;
+#endif
+  }
+
+  
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+    return;
+  } else {
+    Serial.println("camera ready");
+    camera_sign = true;  
+  }
+
+  sensor_t* s = esp_camera_sensor_get();
+  
+  s->set_special_effect(s, 2);
+#endif
+
+  strncpy(message, "default message", MAXSTRARGLEN);
+  delay(100);
+  memset(data, 0, MAXDATALEN);
+  memset(header, 0, 16);
+  Serial.println("[ready]");
+}
+
+void (*queued_action)() = NULL;
+
+void loop() {
+  if (queued_action) {
+    
+    
+    delay(1000);
+    Serial.println("executing queued actions");
+    
+    void (*tmp)() = queued_action;
+    queued_action = NULL;
+    tmp();
+  }
+  if (command >= 0 && command <= MAXCOMMAND) {
+    for (int i = 0; i < NUMCOMMANDS; ++i) {
+      if (commands[i].id == command && commands[i].num_args == currentArg) {
+        if (commands[i].wifi && !WiFi.isConnected()) {
+          setError("wifi not connected");
+        } else {
+          Serial.print("processing command: ");
+          Serial.println(commands[i].name);
+          commands[i].command_fp();
+        }
+      }
+    }
+  }
+  cbl.eventLoopTick();
+}
+
+int onReceived(uint8_t type, enum Endpoint model, int datalen) {
+  char varName = header[3];
+
+  Serial.print("unlocked: ");
+  Serial.println(unlocked);
+
+  
+  if (!unlocked && varName == 'P') {
+    auto password = TIVar::realToLong8x(data, model);
+    if (password == PASSWORD) {
+      Serial.println("successful unlock");
+      unlocked = true;
+      return 0;
+    } else {
+      Serial.println("failed unlock");
+    }
+  }
+
+  if (!unlocked) {
+    return -1;
+  }
+
+  
+  if (varName == 'C') {
+    if (type != VarTypes82::VarReal) {
+      return -1;
+    }
+    int cmd = TIVar::realToLong8x(data, model);
+    if (cmd >= 0 && cmd <= MAXCOMMAND) {
+      Serial.print("command: ");
+      Serial.println(cmd);
+      startCommand(cmd);
+      return 0;
+    } else {
+      Serial.print("invalid command: ");
+      Serial.println(cmd);
+      return -1;
+    }
+  }
+
+  if (currentArg >= MAXARGS) {
+    Serial.println("argument overflow");
+    setError("argument overflow");
+    return -1;
+  }
+
+  switch (type) {
+    case VarTypes82::VarString:
+      Serial.print("len: ");
+      strncpy(strArgs[currentArg++], TIVar::strVarToString8x(data, model).c_str(), MAXSTRARGLEN);
+      fixStrVar(strArgs[currentArg - 1]);
+      Serial.print("Str");
+      Serial.print(currentArg - 1);
+      Serial.print(" ");
+      Serial.println(strArgs[currentArg - 1]);
+      break;
+    case VarTypes82::VarReal:
+      realArgs[currentArg++] = TIVar::realToFloat8x(data, model);
+      Serial.print("Real");
+      Serial.print(currentArg - 1);
+      Serial.print(" ");
+      Serial.println(realArgs[currentArg - 1]);
+      break;
+    default:
+      
+      return -1;
+  }
+  return 0;
+}
+
+uint8_t frameCallback(int idx) {
+  return frame[idx];
+}
+
+char varIndex(int idx) {
+  return '0' + (idx == 9 ? 0 : (idx + 1));
+}
+
+int onRequest(uint8_t type, enum Endpoint model, int* headerlen, int* datalen, data_callback* data_callback) {
+  char varName = header[3];
+  char strIndex = header[4];
+  char strname[5] = { 'S', 't', 'r', varIndex(strIndex), 0x00 };
+  char picname[5] = { 'P', 'i', 'c', varIndex(strIndex), 0x00 };
+  Serial.print("request for ");
+  Serial.println(varName == 0xaa ? strname : varName == 0x60 ? picname
+                                                             : (const char*)&header[3]);
+  memset(header, 0, sizeof(header));
+  switch (varName) {
+    case 0x60:
+      if (type != VarTypes82::VarPic) {
+        return -1;
+      }
+      *datalen = PICVARSIZE;
+      TIVar::intToSizeWord(*datalen, &header[0]);
+      header[2] = VarTypes82::VarPic;
+      header[3] = 0x60;
+      header[4] = strIndex;
+      *data_callback = frameCallback;
+      break;
+    case 0xAA:
+      if (type != VarTypes82::VarString) {
+        return -1;
+      }
+      
+      *datalen = TIVar::stringToStrVar8x(String(message), data, model);
+      TIVar::intToSizeWord(*datalen, header);
+      header[2] = VarTypes82::VarString;
+      header[3] = 0xAA;
+      
+      header[4] = strIndex;
+      *headerlen = 13;
+      break;
+    case 'E':
+      if (type != VarTypes82::VarReal) {
+        return -1;
+      }
+      *datalen = TIVar::longToReal8x(error, data, model);
+      TIVar::intToSizeWord(*datalen, header);
+      header[2] = VarTypes82::VarReal;
+      header[3] = 'E';
+      header[4] = '\0';
+      *headerlen = 13;
+      break;
+    case 'S':
+      if (type != VarTypes82::VarReal) {
+        return -1;
+      }
+      *datalen = TIVar::longToReal8x(status, data, model);
+      TIVar::intToSizeWord(*datalen, header);
+      header[2] = VarTypes82::VarReal;
+      header[3] = 'S';
+      header[4] = '\0';
+      *headerlen = 13;
+      break;
+    default:
+      return -1;
+  }
+  return 0;
+}
+
+int makeRequest(String url, char* result, int resultLen, size_t* len) {
+  memset(result, 0, resultLen);
+
+#ifdef SECURE
+  WiFiClientSecure client;
+  client.setInsecure();
+#else
+  WiFiClient client;
+#endif
+  HTTPClient http;
+  if ((HTTP_USERNAME && HTTP_USERNAME[0]) || (HTTP_PASSWORD && HTTP_PASSWORD[0])) {
+    http.setAuthorization(HTTP_USERNAME, HTTP_PASSWORD);
+  }
+  http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+
+  Serial.println(url);
+  http.begin(client, url.c_str());
+
+  
+  int httpResponseCode = http.GET();
+  Serial.print(url);
+  Serial.print(" ");
+  Serial.println(httpResponseCode);
+
+  int responseSize = http.getSize();
+  WiFiClient* httpStream = http.getStreamPtr();
+
+  Serial.print("response size: ");
+  Serial.println(responseSize);
+
+  if (httpResponseCode != 200) {
+    http.end();
+    return httpResponseCode;
+  }
+
+  if (httpStream->available() > resultLen) {
+    Serial.print("response size: ");
+    Serial.print(httpStream->available());
+    Serial.println(" is too big");
+    http.end();
+    return -1;
+  }
+
+  while (httpStream->available()) {
+    *(result++) = httpStream->read();
+  }
+  *len = responseSize;
+
+  http.end();
+
+  return 0;
+}
+
+struct ParsedUrl {
+  bool https;
+  String host;
+  uint16_t port;
+  String path;
+};
+
+bool parseUrl(const String& url, ParsedUrl* out) {
+  int schemeEnd = url.indexOf("://");
+  if (schemeEnd < 0) {
+    return false;
+  }
+  String scheme = url.substring(0, schemeEnd);
+  bool isHttps = scheme == "https";
+  if (!isHttps && scheme != "http") {
+    return false;
+  }
+
+  int hostStart = schemeEnd + 3;
+  int pathStart = url.indexOf('/', hostStart);
+  String hostPort = (pathStart < 0) ? url.substring(hostStart) : url.substring(hostStart, pathStart);
+  String path = (pathStart < 0) ? "/" : url.substring(pathStart);
+
+  int colon = hostPort.indexOf(':');
+  String host = hostPort;
+  uint16_t port = isHttps ? 443 : 80;
+  if (colon >= 0) {
+    host = hostPort.substring(0, colon);
+    port = (uint16_t)hostPort.substring(colon + 1).toInt();
+  }
+
+  if (!host.length()) {
+    return false;
+  }
+
+  out->https = isHttps;
+  out->host = host;
+  out->port = port;
+  out->path = path;
+  return true;
+}
+
+bool readLine(WiFiClientSecure& client, char* line, size_t lineLen, uint32_t timeoutMs) {
+  size_t idx = 0;
+  uint32_t start = millis();
+  while (millis() - start < timeoutMs) {
+    while (client.available()) {
+      char c = client.read();
+      if (c == '\r') {
+        continue;
+      }
+      if (c == '\n') {
+        line[idx] = '\0';
+        return true;
+      }
+      if (idx + 1 < lineLen) {
+        line[idx++] = c;
+      }
+    }
+    delay(1);
+  }
+  line[idx] = '\0';
+  return idx > 0;
+}
+
+int parseStatusCode(const char* statusLine) {
+  const char* space = strchr(statusLine, ' ');
+  if (!space) {
+    return -1;
+  }
+  return atoi(space + 1);
+}
+
+constexpr int PROXY_ERR_DNS = -101;
+constexpr int PROXY_ERR_BAD_IP = -102;
+constexpr int PROXY_ERR_CONNECT = -103;
+constexpr int PROXY_ERR_CONNECT_RESPONSE = -104;
+constexpr int PROXY_ERR_CONNECT_STATUS = -105;
+constexpr int PROXY_ERR_TLS = -106;
+constexpr int PROXY_ERR_PARSE_URL = -107;
+constexpr int PROXY_ERR_HTTP_BEGIN = -108;
+constexpr int PROXY_ERR_RESP_TOO_LARGE = -109;
+constexpr int PROXY_ERR_NO_PROXY = -110;
+
+int openProxyTunnel(WiFiClientSecure& client, const ParsedUrl& target, const ProxyEndpoint& proxy) {
+  IPAddress proxyIp;
+  if (proxy.ip && proxy.ip[0]) {
+    if (!proxyIp.fromString(proxy.ip)) {
+      Serial.print("bad proxy ip: ");
+      Serial.println(proxy.ip);
+      return PROXY_ERR_BAD_IP;
+    }
+  } else if (!WiFi.hostByName(proxy.host, proxyIp)) {
+    Serial.print("proxy DNS failed: ");
+    Serial.println(proxy.host);
+    return PROXY_ERR_DNS;
+  }
+
+  client.setInsecure();
+  client.setPlainStart();
+  client.setHandshakeTimeout(HTTP_TIMEOUT_MS);
+  client.setTimeout(HTTP_TIMEOUT_MS);
+
+  Serial.print("proxy target: ");
+  Serial.print(proxy.host);
+  Serial.print(":");
+  Serial.print(proxy.port);
+  Serial.print(" via ");
+  Serial.println(proxyIp);
+  Serial.print("heap before proxy connect: ");
+  Serial.println(ESP.getFreeHeap());
+
+  // Preferred: preserve target host as TLS hostname for post-CONNECT startTLS.
+  if (!client.connect(proxyIp, proxy.port, target.host.c_str(), nullptr, nullptr, nullptr)) {
+    // Fallback: plain connect setup if SNI-seeded connect path fails on this core.
+    client.stop();
+    if (!client.connect(proxyIp, proxy.port)) {
+      Serial.print("proxy TCP connect failed: ");
+      Serial.print(proxyIp);
+      Serial.print(":");
+      Serial.println(proxy.port);
+      return PROXY_ERR_CONNECT;
+    }
+  }
+
+
+  String auth = String(PROXY_USER) + ":" + String(PROXY_PASS);
+  String auth64 = base64::encode(auth);
+  String hostPort = target.host + ":" + String(target.port);
+  String req = "CONNECT " + hostPort + " HTTP/1.1\r\n";
+  req += "Host: " + hostPort + "\r\n";
+  req += "Proxy-Authorization: Basic " + auth64 + "\r\n";
+  req += "Proxy-Connection: keep-alive\r\n";
+  req += "Connection: keep-alive\r\n\r\n";
+
+  client.print(req);
+
+  char line[128];
+  if (!readLine(client, line, sizeof(line), HTTP_TIMEOUT_MS)) {
+    Serial.println("proxy CONNECT no response");
+    return PROXY_ERR_CONNECT_RESPONSE;
+  }
+  int status = parseStatusCode(line);
+  if (status != 200) {
+    Serial.print("proxy CONNECT failed: ");
+    Serial.println(line);
+    return PROXY_ERR_CONNECT_STATUS;
+  }
+
+  while (readLine(client, line, sizeof(line), HTTP_TIMEOUT_MS)) {
+    if (line[0] == '\0') {
+      break;
+    }
+  }
+
+  if (client.startTLS() != 1) {
+    Serial.println("proxy TLS start failed");
+    return PROXY_ERR_TLS;
+  }
+  Serial.print("heap after proxy tls: ");
+  Serial.println(ESP.getFreeHeap());
+  return 0;
+}
+
+int makePostRequestProxy(String url, const char* contentType, const char* body, char* result, int resultLen, size_t* len) {
+  memset(result, 0, resultLen);
+
+  ParsedUrl target;
+  if (!parseUrl(url, &target)) {
+    return PROXY_ERR_PARSE_URL;
+  }
+  if (!target.https) {
+    return makePostRequest(url, contentType, body, result, resultLen, len);
+  }
+
+  int lastErr = PROXY_ERR_NO_PROXY;
+  for (size_t attempt = 0; attempt < NUM_PROXIES; ++attempt) {
+    size_t idx = (proxy_index + attempt) % NUM_PROXIES;
+    const ProxyEndpoint& proxy = PROXIES[idx];
+    Serial.print("proxy: ");
+    Serial.print(proxy.host);
+    Serial.print(":");
+    Serial.println(proxy.port);
+
+    WiFiClientSecure client;
+    int tunnelErr = openProxyTunnel(client, target, proxy);
+    if (tunnelErr != 0) {
+      lastErr = tunnelErr;
+      client.stop();
+      continue;
+    }
+
+    HTTPClient http;
+    if ((HTTP_USERNAME && HTTP_USERNAME[0]) || (HTTP_PASSWORD && HTTP_PASSWORD[0])) {
+      http.setAuthorization(HTTP_USERNAME, HTTP_PASSWORD);
+    }
+    http.setConnectTimeout(HTTP_TIMEOUT_MS);
+    http.setTimeout(HTTP_TIMEOUT_MS);
+
+    if (!http.begin(client, target.host, target.port, target.path, target.https)) {
+      Serial.println("proxy HTTP begin failed");
+      http.end();
+      lastErr = PROXY_ERR_HTTP_BEGIN;
+      client.stop();
+      continue;
+    }
+    if (contentType) {
+      http.addHeader("Content-Type", contentType);
+    }
+
+    int httpResponseCode = http.POST((uint8_t*)body, strlen(body));
+    if (httpResponseCode < 0) {
+      Serial.print("proxy POST failed: ");
+      Serial.print(httpResponseCode);
+      Serial.print(" ");
+      Serial.println(http.errorToString(httpResponseCode));
+      http.end();
+      lastErr = httpResponseCode;
+      client.stop();
+      continue;
+    }
+    String responseBody = http.getString();
+    http.end();
+
+    if (responseBody.length() >= (size_t)resultLen) {
+      Serial.print("proxy response too large: ");
+      Serial.println(responseBody.length());
+      lastErr = PROXY_ERR_RESP_TOO_LARGE;
+      client.stop();
+      continue;
+    }
+
+    strncpy(result, responseBody.c_str(), resultLen - 1);
+    result[resultLen - 1] = '\0';
+    *len = responseBody.length();
+
+    proxy_index = (idx + 1) % NUM_PROXIES;
+    if (httpResponseCode < 200 || httpResponseCode >= 300) {
+      return httpResponseCode;
+    }
+    return 0;
+  }
+
+  return lastErr;
+}
+
+int makePostRequest(String url, const char* contentType, const char* body, char* result, int resultLen, size_t* len) {
+  memset(result, 0, resultLen);
+
+#ifdef SECURE
+  WiFiClientSecure client;
+  client.setInsecure();
+#else
+  WiFiClient client;
+#endif
+  HTTPClient http;
+  if ((HTTP_USERNAME && HTTP_USERNAME[0]) || (HTTP_PASSWORD && HTTP_PASSWORD[0])) {
+    http.setAuthorization(HTTP_USERNAME, HTTP_PASSWORD);
+  }
+  http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+
+  Serial.println(url);
+  http.begin(client, url.c_str());
+  if (contentType) {
+    http.addHeader("Content-Type", contentType);
+  }
+
+  int httpResponseCode = http.POST((uint8_t*)body, strlen(body));
+  Serial.print(url);
+  Serial.print(" POST ");
+  Serial.println(httpResponseCode);
+
+  String responseBody = http.getString();
+  http.end();
+
+  if (responseBody.length() >= (size_t)resultLen) {
+    Serial.print("response size: ");
+    Serial.print(responseBody.length());
+    Serial.println(" is too big");
+    return -1;
+  }
+
+  strncpy(result, responseBody.c_str(), resultLen - 1);
+  result[resultLen - 1] = '\0';
+  *len = responseBody.length();
+
+  if (httpResponseCode < 200 || httpResponseCode >= 300) {
+    return httpResponseCode;
+  }
+
+  return 0;
+}
+
+String jsonEscape(const char* input) {
+  String out;
+  for (size_t i = 0; input[i] != '\0'; ++i) {
+    const char c = input[i];
+    switch (c) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '"':
+        out += "\\\"";
+        break;
+      case '\b':
+        out += "\\b";
+        break;
+      case '\f':
+        out += "\\f";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        if ((uint8_t)c < 0x20) {
+          char buf[7];
+          snprintf(buf, sizeof(buf), "\\u%04x", (unsigned int)(uint8_t)c);
+          out += buf;
+        } else {
+          out += c;
+        }
+        break;
+    }
+  }
+  return out;
+}
+
+void connect() {
+  const char* ssid = WIFI_SSID;
+  const char* pass = WIFI_PASS;
+  Serial.print("SSID: ");
+  Serial.println(ssid);
+  Serial.print("PASS: ");
+  Serial.println("<hidden>");
+  WiFi.begin(ssid, pass);
+  while (WiFi.status() != WL_CONNECTED) {
+    if (WiFi.status() == WL_CONNECT_FAILED) {
+      setError("failed to connect");
+      return;
+    }
+  }
+  setSuccess("connected");
+}
+
+void disconnect() {
+  WiFi.disconnect(true);
+  setSuccess("disconnected");
+}
+
+void gpt() {
+  const char* prompt = strArgs[0];
+  Serial.print("prompt: ");
+  Serial.println(prompt);
+  Serial.print("heap at gpt start: ");
+  Serial.println(ESP.getFreeHeap());
+
+  auto url = String(SERVER) + String(API_SEND_PATH);
+  auto payload = String("{\"text\":\"") + jsonEscape(prompt) + "\"}";
+
+  size_t realsize = 0;
+#ifdef USE_PROXY
+  int rc = makePostRequestProxy(url, "application/json", payload.c_str(), response, MAXHTTPRESPONSELEN, &realsize);
+#else
+  int rc = makePostRequest(url, "application/json", payload.c_str(), response, MAXHTTPRESPONSELEN, &realsize);
+#endif
+  if (rc) {
+    if (response[0]) {
+      setError(response);
+      return;
+    }
+    switch (rc) {
+      case PROXY_ERR_DNS:
+        setError("proxy dns failed");
+        return;
+      case PROXY_ERR_BAD_IP:
+        setError("proxy ip invalid");
+        return;
+      case PROXY_ERR_CONNECT:
+        setError("proxy tcp failed");
+        return;
+      case PROXY_ERR_CONNECT_RESPONSE:
+        setError("proxy no response");
+        return;
+      case PROXY_ERR_CONNECT_STATUS:
+        setError("proxy connect rejected");
+        return;
+      case PROXY_ERR_TLS:
+        setError("proxy tls failed");
+        return;
+      case PROXY_ERR_PARSE_URL:
+        setError("proxy url parse failed");
+        return;
+      case PROXY_ERR_HTTP_BEGIN:
+        setError("proxy http begin failed");
+        return;
+      case PROXY_ERR_RESP_TOO_LARGE:
+        setError("proxy resp too large");
+        return;
+      case PROXY_ERR_NO_PROXY:
+        setError("proxy all endpoints failed");
+        return;
+      case -1:
+        setError("http conn refused");
+        return;
+      case -2:
+        setError("http send hdr failed");
+        return;
+      case -3:
+        setError("http send body failed");
+        return;
+      case -4:
+        setError("http not connected");
+        return;
+      case -5:
+        setError("http conn lost");
+        return;
+      case -6:
+        setError("http no stream");
+        return;
+      case -7:
+        setError("http no server");
+        return;
+      case -8:
+        setError("http low ram");
+        return;
+      case -9:
+        setError("http bad encoding");
+        return;
+      case -10:
+        setError("http stream write");
+        return;
+      case -11:
+        setError("http read timeout");
+        return;
+      default:
+        break;
+    }
+    char err[32];
+    snprintf(err, sizeof(err), rc > 0 ? "HTTP %d" : "POST %d", rc);
+    setError(err);
+    return;
+  }
+
+  Serial.print("response: ");
+  Serial.println(response);
+
+  setSuccess(response);
+}
+
+void send() {
+  const char* recipient = strArgs[0];
+  const char* message = strArgs[1];
+  Serial.print("sending \"");
+  Serial.print(message);
+  Serial.print("\" to \"");
+  Serial.print(recipient);
+  Serial.println("\"");
+  setSuccess("OK: sent");
+}
+
+void _sendLauncher() {
+  sendProgramVariable("TI32", __launcher_var, __launcher_var_len);
+}
+
+void launcher() {
+  
+  
+  queued_action = _sendLauncher;
+  setSuccess("queued transfer");
+}
+
+void snap() {
+#ifdef CAMERA
+  if (!camera_sign) {
+    setError("camera failed to initialize");
+  }
+#else
+  setError("pictures not supported");
+#endif
+}
+
+void solve() {
+#ifdef CAMERA
+  if (!camera_sign) {
+    setError("camera failed to initialize");
+  }
+#else
+  setError("pictures not supported");
+#endif
+}
+
+void image_list() {
+  int page = realArgs[0];
+  auto url = String(SERVER) + String("/image/list?p=") + urlEncode(String(page));
+
+  size_t realsize = 0;
+  if (makeRequest(url, response, MAXSTRARGLEN, &realsize)) {
+    setError("error making request");
+    return;
+  }
+
+  Serial.print("response: ");
+  Serial.println(response);
+
+  setSuccess(response);
+}
+
+void fetch_image() {
+  memset(frame + 2, 0, 756);
+  
+  int id = realArgs[0];
+  Serial.print("id: ");
+  Serial.println(id);
+
+  auto url = String(SERVER) + String("/image/get?id=") + urlEncode(String(id));
+
+  size_t realsize = 0;
+  if (makeRequest(url, response, MAXHTTPRESPONSELEN, &realsize)) {
+    setError("error making request");
+    return;
+  }
+
+  if (realsize != PICSIZE) {
+    Serial.print("response size:");
+    Serial.println(realsize);
+    setError("bad image size");
+    return;
+  }
+
+  
+  frame[0] = realsize & 0xff;
+  frame[1] = (realsize >> 8) & 0xff;
+  memcpy(&frame[2], response, 756);
+
+  setSuccess(response);
+}
+
+void fetch_chats() {
+  int room = realArgs[0];
+  int page = realArgs[1];
+  auto url = String(SERVER) + String("/chats/messages?p=") + urlEncode(String(page)) + String("&c=") + urlEncode(String(room));
+
+  size_t realsize = 0;
+  if (makeRequest(url, response, MAXSTRARGLEN, &realsize)) {
+    setError("error making request");
+    return;
+  }
+
+  Serial.print("response: ");
+  Serial.println(response);
+
+  setSuccess(response);
+}
+
+void send_chat() {
+  int room = realArgs[0];
+  const char* msg = strArgs[1];
+
+  auto url = String(SERVER) + String("/chats/send?c=") + urlEncode(String(room)) + String("&m=") + urlEncode(String(msg)) + String("&id=") + urlEncode(String(CHAT_NAME));
+
+  size_t realsize = 0;
+  if (makeRequest(url, response, MAXSTRARGLEN, &realsize)) {
+    setError("error making request");
+    return;
+  }
+
+  Serial.print("response: ");
+  Serial.println(response);
+
+  setSuccess(response);
+}
+
+void program_list() {
+  int page = realArgs[0];
+  auto url = String(SERVER) + String("/programs/list?p=") + urlEncode(String(page));
+
+  size_t realsize = 0;
+  if (makeRequest(url, response, MAXSTRARGLEN, &realsize)) {
+    setError("error making request");
+    return;
+  }
+
+  Serial.print("response: ");
+  Serial.println(response);
+
+  setSuccess(response);
+}
+
+
+char programName[256];
+char programData[4096];
+size_t programLength;
+
+void _resetProgram() {
+  memset(programName, 0, 256);
+  memset(programData, 0, 4096);
+  programLength = 0;
+}
+
+void _sendDownloadedProgram() {
+  if (sendProgramVariable(programName, (uint8_t*)programData, programLength)) {
+    Serial.println("failed to transfer requested download");
+    Serial.print(programName);
+    Serial.print("(");
+    Serial.print(programLength);
+    Serial.println(")");
+  }
+  _resetProgram();
+}
+
+void fetch_program() {
+  int id = realArgs[0];
+  Serial.print("id: ");
+  Serial.println(id);
+
+  _resetProgram();
+
+  auto url = String(SERVER) + String("/programs/get?id=") + urlEncode(String(id));
+
+  if (makeRequest(url, programData, 4096, &programLength)) {
+    setError("error making request for program data");
+    return;
+  }
+
+  size_t realsize = 0;
+  auto nameUrl = String(SERVER) + String("/programs/get_name?id=") + urlEncode(String(id));
+  if (makeRequest(nameUrl, programName, 256, &realsize)) {
+    setError("error making request for program name");
+    return;
+  }
+
+  queued_action = _sendDownloadedProgram;
+
+  setSuccess("queued download");
+}
+
+
+
+int sendProgramVariable(const char* name, uint8_t* program, size_t variableSize) {
+  Serial.print("transferring: ");
+  Serial.print(name);
+  Serial.print("(");
+  Serial.print(variableSize);
+  Serial.println(")");
+
+  int dataLength = 0;
+
+  
+  
+  uint8_t msg_header[4] = { COMP83P, RTS, 13, 0 };
+
+  uint8_t rtsdata[13] = { variableSize & 0xff, variableSize >> 8, VarTypes82::VarProgram, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+  int nameSize = strlen(name);
+  if (nameSize == 0) {
+    return 1;
+  }
+  memcpy(&rtsdata[3], name, min(nameSize, 8));
+
+  auto rtsVal = cbl.send(msg_header, rtsdata, 13);
+  if (rtsVal) {
+    Serial.print("rts return: ");
+    Serial.println(rtsVal);
+    return rtsVal;
+  }
+
+  cbl.resetLines();
+  auto ackVal = cbl.get(msg_header, NULL, &dataLength, 0);
+  if (ackVal || msg_header[1] != ACK) {
+    Serial.print("ack return: ");
+    Serial.println(ackVal);
+    return ackVal;
+  }
+
+  auto ctsRet = cbl.get(msg_header, NULL, &dataLength, 0);
+  if (ctsRet || msg_header[1] != CTS) {
+    Serial.print("cts return: ");
+    Serial.println(ctsRet);
+    return ctsRet;
+  }
+
+  msg_header[1] = ACK;
+  msg_header[2] = 0x00;
+  msg_header[3] = 0x00;
+  ackVal = cbl.send(msg_header, NULL, 0);
+  if (ackVal || msg_header[1] != ACK) {
+    Serial.print("ack cts return: ");
+    Serial.println(ackVal);
+    return ackVal;
+  }
+
+  msg_header[1] = DATA;
+  msg_header[2] = variableSize & 0xff;
+  msg_header[3] = (variableSize >> 8) & 0xff;
+  auto dataRet = cbl.send(msg_header, program, variableSize);
+  if (dataRet) {
+    Serial.print("data return: ");
+    Serial.println(dataRet);
+    return dataRet;
+  }
+
+  ackVal = cbl.get(msg_header, NULL, &dataLength, 0);
+  if (ackVal || msg_header[1] != ACK) {
+    Serial.print("ack data: ");
+    Serial.println(ackVal);
+    return ackVal;
+  }
+
+  msg_header[1] = EOT;
+  msg_header[2] = 0x00;
+  msg_header[3] = 0x00;
+  auto eotVal = cbl.send(msg_header, NULL, 0);
+  if (eotVal) {
+    Serial.print("eot return: ");
+    Serial.println(eotVal);
+    return eotVal;
+  }
+
+  Serial.print("transferred: ");
+  Serial.println(name);
+  return 0;
+}
