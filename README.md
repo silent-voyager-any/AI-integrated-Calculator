@@ -14,26 +14,10 @@ This project demonstrates integrating a ChatGPT language model into a standard c
 - Calculator hardware (include exact model if applicable)
 - Optional: Microcontroller interfacing or hardware modification
 
-## Installation
-1. Clone the repository:
-```bash
-git clone https://github.com/yourusername/chatgpt-calculator.git
-```
-
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-3. Run the program:
-```bash
-python main.py
-```
-
 ## Usage
-1. Power on the calculator (or connect your device).
-2. Input your question or calculation.
-3. Receive AI-assisted output directly on the calculator display.
+1. Power on the calculator.
+3. Input your question or calculation.
+4. Receive AI-assisted output directly on the calculator display.
 
 ## Learning Points
 - Bridging software and hardware constraints
