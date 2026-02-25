@@ -1,4 +1,4 @@
-
+//Wifi and server, make sure to edit the ""
 static constexpr const char* WIFI_SSID = "";
 static constexpr const char* WIFI_PASS = "";
 static constexpr const char* SERVER = "";
@@ -7,6 +7,7 @@ static constexpr const char* CHAT_NAME = "";
 static constexpr const char* HTTP_USERNAME = "";
 static constexpr const char* HTTP_PASSWORD = "";
 
+//Credentials go here if you set up a proxy
 #define USE_PROXY
 static constexpr const char* PROXY_USER = "";
 static constexpr const char* PROXY_PASS = "";
