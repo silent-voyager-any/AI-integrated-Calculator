@@ -11,9 +11,9 @@ This project demonstrates integrating a ChatGPT language model into a standard c
 - **Real-time Processing:** Immediate responses without external devices, demonstrating hardware-software integration.
 
 ## Technologies Used
-- Python (or C/C++ depending on your implementation)
+- C/C++
 - ChatGPT API / Local model integration
-- Calculator hardware (include exact model if applicable)
+- Calculator hardware (TI-84+)
 - Optional: Microcontroller interfacing or hardware modification
 
 ## Usage
